@@ -33,11 +33,14 @@ const SEV_COLORS: Record<string, string> = {
   low: "bg-muted text-muted-foreground border-border",
 };
 
+type ColumnStatsMap = Record<string, Record<string, unknown> & { type: string }>;
+
 type DatasetRecord = {
   filename: string;
   row_count: number;
   col_count: number;
   sample_rows_json: Record<string, unknown>[];
+  column_stats_json: ColumnStatsMap | null;
 };
 
 function QualityGauge({ score }: { score: number }) {
@@ -312,33 +315,169 @@ function average(values: number[]) {
   return values.reduce((sum, v) => sum + v, 0) / values.length;
 }
 
-function buildDemoAnalysis(dataset: DatasetRecord): AnalysisJson {
+function numAt(stats: ColumnStatsMap, col: string, key: string): number | undefined {
+  const v = stats[col]?.[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** Pearson correlation coefficient between two equal-length numeric arrays. */
+function pearsonCorrelation(xs: number[], ys: number[]): number {
+  const n = xs.length;
+  if (n < 3) return 0;
+  const meanX = average(xs);
+  const meanY = average(ys);
+  let num = 0;
+  let denX = 0;
+  let denY = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - meanX;
+    const dy = ys[i] - meanY;
+    num += dx * dy;
+    denX += dx * dx;
+    denY += dy * dy;
+  }
+  const den = Math.sqrt(denX * denY);
+  return den === 0 ? 0 : num / den;
+}
+
+function pairedNumericValues(
+  rows: Record<string, unknown>[],
+  colA: string,
+  colB: string,
+): { xs: number[]; ys: number[] } {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const row of rows) {
+    if (row[colA] === null || row[colA] === undefined || row[colA] === "") continue;
+    if (row[colB] === null || row[colB] === undefined || row[colB] === "") continue;
+    const x = Number(row[colA]);
+    const y = Number(row[colB]);
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      xs.push(x);
+      ys.push(y);
+    }
+  }
+  return { xs, ys };
+}
+
+/** Computes real Pearson correlations across every pair of numeric columns, strongest first. */
+function computeCorrelations(
+  sample: Record<string, unknown>[],
+  numericColumns: string[],
+): AnalysisJson["correlations"] {
+  const results: AnalysisJson["correlations"] = [];
+  for (let i = 0; i < numericColumns.length; i++) {
+    for (let j = i + 1; j < numericColumns.length; j++) {
+      const { xs, ys } = pairedNumericValues(sample, numericColumns[i], numericColumns[j]);
+      if (xs.length < 5) continue;
+      const strength = pearsonCorrelation(xs, ys);
+      if (Number.isFinite(strength)) {
+        results.push({
+          col_a: numericColumns[i],
+          col_b: numericColumns[j],
+          strength,
+          direction: strength >= 0 ? "positive" : "negative",
+          business_meaning:
+            Math.abs(strength) >= 0.5
+              ? `${numericColumns[i]} and ${numericColumns[j]} move together in the sampled rows — worth checking whether one drives the other.`
+              : `${numericColumns[i]} and ${numericColumns[j]} show only a weak relationship in the sampled rows.`,
+        } as AnalysisJson["correlations"][number]);
+      }
+    }
+  }
+  return results.sort((a, b) => Math.abs(b.strength) - Math.abs(a.strength)).slice(0, 5);
+}
+
+/** Flags values outside the 1.5x-IQR fence (computed from the full-file column stats) among the sampled rows. */
+function computeAnomalies(dataset: DatasetRecord, numericColumns: string[]): AnalysisJson["anomalies"] {
+  const sample = dataset.sample_rows_json ?? [];
+  const stats = dataset.column_stats_json ?? {};
+  const anomalies: AnalysisJson["anomalies"] = [];
+
+  for (const col of numericColumns) {
+    const p25 = numAt(stats, col, "p25");
+    const p75 = numAt(stats, col, "p75");
+    if (p25 === undefined || p75 === undefined) continue;
+
+    const iqr = p75 - p25;
+    if (iqr <= 0) continue;
+    const lower = p25 - 1.5 * iqr;
+    const upper = p75 + 1.5 * iqr;
+
+    const outliers = sample
+      .map((row) => Number(row[col]))
+      .filter((v) => Number.isFinite(v) && (v < lower || v > upper));
+    if (outliers.length === 0) continue;
+
+    const farthest = Math.max(...outliers.map((v) => Math.max(v - upper, lower - v)));
+    const severity: "low" | "medium" | "high" =
+      farthest > iqr * 3 ? "high" : farthest > iqr * 1.5 ? "medium" : "low";
+
+    anomalies.push({
+      severity,
+      column: col,
+      description: `${outliers.length} value(s) fall outside the typical ${p25.toFixed(1)}–${p75.toFixed(1)} range (1.5× IQR fence: ${lower.toFixed(1)} to ${upper.toFixed(1)}) among the sampled rows.`,
+      example_values: outliers.slice(0, 3).map(String),
+      count: outliers.length,
+    });
+  }
+
+  return anomalies.sort((a, b) => b.count - a.count).slice(0, 5);
+}
+
+/** Data quality score derived from real null-rate stats, penalized by detected anomalies. */
+function computeDataQuality(
+  dataset: DatasetRecord,
+  anomalyCount: number,
+): AnalysisJson["data_quality"] {
+  const stats = dataset.column_stats_json ?? {};
+  const columns = Object.keys(stats);
+
+  const nullPcts = columns.map((c) => numAt(stats, c, "null_pct") ?? 0);
+  const avgNullPct = nullPcts.length ? average(nullPcts) : 0;
+  const overall_score = Math.max(0, Math.min(100, Math.round(100 - avgNullPct - anomalyCount * 2)));
+
+  const issues = columns
+    .map((col) => ({ col, null_pct: numAt(stats, col, "null_pct") ?? 0, null_count: numAt(stats, col, "null_count") ?? 0 }))
+    .filter((c) => c.null_pct > 5)
+    .sort((a, b) => b.null_pct - a.null_pct)
+    .slice(0, 5)
+    .map((c) => ({
+      column: c.col,
+      issue: `${c.null_pct.toFixed(1)}% missing values`,
+      severity: (c.null_pct > 30 ? "high" : c.null_pct > 10 ? "medium" : "low") as "low" | "medium" | "high",
+      rows_affected: Math.round(c.null_count),
+    }));
+
+  return { overall_score, issues };
+}
+
+function buildAnalysis(dataset: DatasetRecord): AnalysisJson {
   const sample = dataset.sample_rows_json ?? [];
   const columns = sample.length > 0 ? Object.keys(sample[0]) : [];
+  const statsColumns = dataset.column_stats_json ? Object.keys(dataset.column_stats_json) : [];
 
-  const numericColumns = columns.filter((col) => isNumericColumn(sample, col));
+  const numericColumns =
+    statsColumns.length > 0
+      ? statsColumns.filter((c) => dataset.column_stats_json?.[c]?.type === "numeric")
+      : columns.filter((col) => isNumericColumn(sample, col));
+
   const revenueCol =
     numericColumns.find((c) => c.toLowerCase().includes("revenue")) ??
     numericColumns[0] ??
     columns[0] ??
     "value";
-  const compareCol =
-    numericColumns.find((c) => c !== revenueCol) ??
-    numericColumns[1] ??
-    revenueCol;
   const categoryCol =
     columns.find((c) =>
       ["category", "segment", "type", "group"].some((x) =>
         c.toLowerCase().includes(x),
       ),
     ) ?? columns.find((c) => !numericColumns.includes(c)) ?? columns[0] ?? "label";
+  const compareCol = numericColumns.find((c) => c !== revenueCol) ?? revenueCol;
 
-  const revenueValues = sample
-    .map((row) => Number(row[revenueCol]))
-    .filter((v) => !Number.isNaN(v));
-
-  const avgRevenue = average(revenueValues);
-  const maxRevenue = revenueValues.length ? Math.max(...revenueValues) : 0;
+  const avgRevenue = numAt(dataset.column_stats_json ?? {}, revenueCol, "mean");
+  const maxRevenue = numAt(dataset.column_stats_json ?? {}, revenueCol, "max");
+  const revenueValuesFallback = sample.map((row) => Number(row[revenueCol])).filter((v) => !Number.isNaN(v));
 
   const uniqueCategories = new Set(
     sample
@@ -346,58 +485,81 @@ function buildDemoAnalysis(dataset: DatasetRecord): AnalysisJson {
       .filter((v) => v !== null && v !== undefined && v !== ""),
   );
 
+  const correlations = computeCorrelations(sample, numericColumns);
+  const anomalies = computeAnomalies(dataset, numericColumns);
+  const data_quality = computeDataQuality(dataset, anomalies.length);
+  const topCorrelation = correlations[0];
+
+  const recommendations: AnalysisJson["recommendations"] = [];
+  const worstIssue = data_quality.issues[0];
+  if (worstIssue) {
+    recommendations.push({
+      priority: 1,
+      category: "data_quality",
+      action: `Investigate missing values in ${worstIssue.column} (${worstIssue.issue}) before building final dashboards.`,
+      expected_impact: "Reduces the chance of misleading KPI interpretation.",
+    });
+  } else {
+    recommendations.push({
+      priority: 1,
+      category: "data_quality",
+      action: "No significant missing-value issues were detected — data looks ready for downstream use.",
+      expected_impact: "Confirms the dataset is safe to build dashboards on directly.",
+    });
+  }
+  if (topCorrelation && Math.abs(topCorrelation.strength) >= 0.5) {
+    recommendations.push({
+      priority: 2,
+      category: "investigation",
+      action: `Investigate the relationship between ${topCorrelation.col_a} and ${topCorrelation.col_b} (r = ${topCorrelation.strength.toFixed(2)}) before treating it as causal.`,
+      expected_impact: "Avoids acting on a correlation that may be coincidental or confounded.",
+    });
+  }
+  recommendations.push({
+    priority: recommendations.length + 1,
+    category: "business",
+    action: `Segment results by ${String(categoryCol)} and compare patterns across ${uniqueCategories.size || 1} groups.`,
+    expected_impact: "Surfaces performance differences that may be hidden in aggregate metrics.",
+  });
+
+  const summaryCorrelationPart = topCorrelation
+    ? `The strongest relationship found is between ${topCorrelation.col_a} and ${topCorrelation.col_b} (r = ${topCorrelation.strength.toFixed(2)}).`
+    : `No strong correlations were detected among the numeric columns.`;
+
   return {
-    executive_summary: `This dataset includes ${dataset.row_count.toLocaleString()} rows across ${dataset.col_count} columns. A quick exploratory pass suggests ${revenueCol} is one of the most informative numeric fields, with visible variation across ${String(categoryCol)} groups. The sample looks clean enough for a first-pass business analysis and supports chart-based insight generation.`,
-    data_quality: {
-      overall_score: 88,
-      completeness_score: 92,
-      consistency_score: 85,
-      validity_score: 87,
-      uniqueness_score: 90,
-      issues: [],
-    },
+    executive_summary: `This dataset includes ${dataset.row_count.toLocaleString()} rows across ${dataset.col_count} columns. ${summaryCorrelationPart} Data quality scored ${data_quality.overall_score}/100 based on missing-value rates${anomalies.length ? ` and ${anomalies.length} flagged outlier column(s)` : ""}.`,
+    data_quality,
     key_metrics: [
       {
         label: "Rows",
         value: dataset.row_count.toLocaleString(),
         unit: "records",
         trend: "flat",
-        insight:
-          "The uploaded dataset was successfully profiled and row volume is sufficient for a first-pass summary.",
+        insight: "The uploaded dataset was successfully profiled and row volume is sufficient for a first-pass summary.",
       },
       {
         label: "Columns",
         value: String(dataset.col_count),
         unit: "fields",
         trend: "flat",
-        insight:
-          "The schema was detected correctly and can support dashboard-style analysis.",
+        insight: "The schema was detected correctly and can support dashboard-style analysis.",
       },
       {
         label: `Avg ${revenueCol}`,
-        value: avgRevenue ? avgRevenue.toFixed(1) : "0",
+        value: (avgRevenue ?? average(revenueValuesFallback)).toFixed(1),
         unit: "",
-        trend: "up",
-        insight: `${revenueCol} shows a stable average across the sampled rows.`,
+        trend: "flat",
+        insight: `Mean of ${revenueCol} computed across the full parsed dataset.`,
       },
       {
         label: `Max ${revenueCol}`,
-        value: maxRevenue ? maxRevenue.toFixed(0) : "0",
+        value: (maxRevenue ?? Math.max(0, ...revenueValuesFallback)).toFixed(0),
         unit: "",
-        trend: "up",
-        insight: `The maximum observed ${revenueCol} indicates meaningful spread in the sample.`,
+        trend: "flat",
+        insight: `Maximum observed value of ${revenueCol}, indicating spread in the data.`,
       },
     ],
-    correlations:
-      numericColumns.length >= 2
-        ? [
-            {
-              col_a: revenueCol,
-              col_b: compareCol,
-              strength: 0.68,
-            },
-          ]
-        : [],
+    correlations,
     suggested_charts: [
       {
         chart_type: "bar",
@@ -426,37 +588,8 @@ function buildDemoAnalysis(dataset: DatasetRecord): AnalysisJson {
             : `Provides a compact first look at how ${revenueCol} varies across the sample.`,
       },
     ],
-    anomalies: [
-      {
-        severity: "low",
-        column: revenueCol,
-        description: `A few values in ${revenueCol} are noticeably higher than the sample average and may deserve follow-up.`,
-        example_values: revenueValues.slice(-3).map(String),
-        count: Math.min(3, revenueValues.length),
-      },
-    ],
-    recommendations: [
-      {
-        priority: 1,
-        category: "data quality",
-        action: `Validate business meaning and formatting for ${revenueCol} before building final dashboards.`,
-        expected_impact: "Reduces the chance of misleading KPI interpretation.",
-      },
-      {
-        priority: 2,
-        category: "analysis",
-        action: `Segment results by ${categoryCol} and compare patterns across ${uniqueCategories.size || 1} groups.`,
-        expected_impact:
-          "Surfaces performance differences that may be hidden in aggregate metrics.",
-      },
-      {
-        priority: 3,
-        category: "next step",
-        action: "Upload a larger dataset or longer time range to strengthen trend confidence.",
-        expected_impact:
-          "Improves reliability of recommendations and chart narratives.",
-      },
-    ],
+    anomalies,
+    recommendations,
   } as AnalysisJson;
 }
 
@@ -487,7 +620,7 @@ const Analyze = () => {
     void (async () => {
       const { data } = await ownedSupabase
         .from("datasets")
-        .select("filename,row_count,col_count,sample_rows_json")
+        .select("filename,row_count,col_count,sample_rows_json,column_stats_json")
         .eq("id", id)
         .maybeSingle();
 
@@ -510,14 +643,14 @@ const Analyze = () => {
     try {
       addToolCall({
         id: crypto.randomUUID(),
-        tool_name: "local_demo_analysis",
+        tool_name: "local_analysis",
         input: {
           dataset_id: id,
           filename: dataset.filename,
           row_count: dataset.row_count,
           col_count: dataset.col_count,
         },
-        result: "Generated local analysis preview",
+        result: "Computed correlations, anomalies, and data quality score from parsed column stats",
         duration_ms: 320,
         called_at: new Date().toISOString(),
       });
@@ -526,7 +659,7 @@ const Analyze = () => {
 
       await new Promise((resolve) => setTimeout(resolve, 500));
 
-      const demoAnalysis = buildDemoAnalysis(dataset);
+      const demoAnalysis = buildAnalysis(dataset);
       let demoAnalysisId = crypto.randomUUID();
 
       const { data: saved, error: saveError } = await ownedSupabase
