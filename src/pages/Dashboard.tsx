@@ -10,7 +10,6 @@ interface DatasetRow {
   col_count: number;
   file_size: number;
   created_at: string;
-  last_analyzed_at: string | null;
 }
 
 const Dashboard = () => {
@@ -19,10 +18,11 @@ const Dashboard = () => {
 
   useEffect(() => {
     void (async () => {
-      const { data } = await ownedSupabase
+      const { data, error } = await ownedSupabase
         .from("datasets")
-        .select("id,filename,row_count,col_count,file_size,created_at,last_analyzed_at")
+        .select("id,filename,row_count,col_count,file_size,created_at")
         .order("created_at", { ascending: false });
+      if (error) console.error("[Dashboard] failed to load datasets", error);
       setDatasets((data as DatasetRow[]) ?? []);
       setLoading(false);
     })();
